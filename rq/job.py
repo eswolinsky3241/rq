@@ -157,6 +157,7 @@ class Job:
         meta: Optional[Dict[str, Any]] = None,
         failure_ttl: Optional[int] = None,
         serializer=None,
+        batch_id: Optional[str] = None,
         *,
         on_success: Optional[Union['Callback', Callable[..., Any]]] = None,  # Callable is deprecated
         on_failure: Optional[Union['Callback', Callable[..., Any]]] = None,  # Callable is deprecated
@@ -199,6 +200,7 @@ class Job:
                 fails. Defaults to None. Passing a callable is deprecated.
             on_stopped (Optional[Union['Callback', Callable[..., Any]]], optional): A callback to run when/if the Job
                 is stopped. Defaults to None. Passing a callable is deprecated.
+            batch_id (Optional[str], optional): A batch ID that the job is being added to. Defaults to None.
 
         Raises:
             TypeError: If `args` is not a tuple/list
@@ -283,6 +285,7 @@ class Job:
         job.timeout = parse_timeout(timeout)
         job._status = status
         job.meta = meta or {}
+        job.batch_id = batch_id
 
         # dependency could be job instance or id, or iterable thereof
         if depends_on is not None:
@@ -667,6 +670,7 @@ class Job:
         self.last_heartbeat: Optional[datetime] = None
         self.allow_dependency_failures: Optional[bool] = None
         self.enqueue_at_front: Optional[bool] = None
+        self.batch_id: Optional[str] = None
 
         from .results import Result
 
@@ -928,6 +932,7 @@ class Job:
         self.started_at = str_to_date(obj.get('started_at'))
         self.ended_at = str_to_date(obj.get('ended_at'))
         self.last_heartbeat = str_to_date(obj.get('last_heartbeat'))
+        self.batch_id = as_text(obj.get('batch_id')) if obj.get('batch_id') else None
         result = obj.get('result')
         if result:
             try:
@@ -1016,6 +1021,7 @@ class Job:
             'ended_at': utcformat(self.ended_at) if self.ended_at else '',
             'last_heartbeat': utcformat(self.last_heartbeat) if self.last_heartbeat else '',
             'worker_name': self.worker_name or '',
+            'batch_id': self.batch_id or '',
         }
 
         if self.retries_left is not None:
@@ -1247,6 +1253,11 @@ class Job:
 
         if delete_dependents:
             self.delete_dependents(pipeline=pipeline)
+
+        if self.batch_id:
+            from .batch import Batch
+
+            connection.delete(Batch.get_key(self.batch_id), self.id)  # Delete job from batch
 
         connection.delete(self.key, self.dependents_key, self.dependencies_key)
 
