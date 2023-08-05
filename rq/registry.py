@@ -463,7 +463,7 @@ def clean_registries(queue: 'Queue', exception_handlers: list):
     registry = StartedJobRegistry(
         name=queue.name, connection=queue.connection, job_class=queue.job_class, serializer=queue.serializer
     )
-    registry.cleanup(exceptioN_handlers=exception_handlers)
+    registry.cleanup(exception_handlers=exception_handlers)
 
     registry = FailedJobRegistry(
         name=queue.name, connection=queue.connection, job_class=queue.job_class, serializer=queue.serializer
