@@ -18,8 +18,6 @@ if TYPE_CHECKING:
 
     from .job import Retry
 
-from .batch import Batch
-from .connections import resolve_connection
 from .defaults import DEFAULT_RESULT_TTL
 from .dependency import Dependency
 from .exceptions import DequeueTimeout, NoSuchJobError
@@ -73,7 +71,7 @@ class Queue:
     @classmethod
     def all(
         cls,
-        connection: Optional['Redis'] = None,
+        connection: 'Redis',
         job_class: Optional[Type['Job']] = None,
         serializer=None,
         death_penalty_class: Optional[Type[BaseDeathPenalty]] = None,
@@ -89,7 +87,6 @@ class Queue:
         Returns:
             queues (List[Queue]): A list of all queues.
         """
-        connection = connection or resolve_connection()
 
         def to_queue(queue_key: Union[bytes, str]):
             return cls.from_queue_key(
@@ -108,7 +105,7 @@ class Queue:
     def from_queue_key(
         cls,
         queue_key: str,
-        connection: Optional['Redis'] = None,
+        connection: 'Redis',
         job_class: Optional[Type['Job']] = None,
         serializer: Any = None,
         death_penalty_class: Optional[Type[BaseDeathPenalty]] = None,
@@ -119,7 +116,7 @@ class Queue:
 
         Args:
             queue_key (str): The queue key
-            connection (Optional[Redis], optional): Redis connection. Defaults to None.
+            connection (Redis): Redis connection. Defaults to None.
             job_class (Optional[Job], optional): Job class. Defaults to None.
             serializer (Any, optional): Serializer. Defaults to None.
             death_penalty_class (Optional[BaseDeathPenalty], optional): Death penalty class. Defaults to None.
@@ -157,12 +154,12 @@ class Queue:
     def __init__(
         self,
         name: str = 'default',
+        connection: 'Redis' = None,
         default_timeout: Optional[int] = None,
-        connection: Optional['Redis'] = None,
         is_async: bool = True,
         job_class: Optional[Union[str, Type['Job']]] = None,
         serializer: Any = None,
-        death_penalty_class: Type[BaseDeathPenalty] = UnixSignalDeathPenalty,
+        death_penalty_class: Optional[Type[BaseDeathPenalty]] = UnixSignalDeathPenalty,
         **kwargs,
     ):
         """Initializes a Queue object.
@@ -179,7 +176,9 @@ class Queue:
             death_penalty_class (Type[BaseDeathPenalty, optional): Job class or a string referencing the Job class path.
                 Defaults to UnixSignalDeathPenalty.
         """
-        self.connection = connection or resolve_connection()
+        if not connection:
+            raise TypeError("Queue() missing 1 required positional argument: 'connection'")
+        self.connection = connection
         prefix = self.redis_queue_namespace_prefix
         self.name = name
         self._key = '{0}{1}'.format(prefix, name)
@@ -196,7 +195,7 @@ class Queue:
             if isinstance(job_class, str):
                 job_class = import_attribute(job_class)
             self.job_class = job_class
-        self.death_penalty_class = death_penalty_class
+        self.death_penalty_class = death_penalty_class  # type: ignore
 
         self.serializer = resolve_serializer(serializer)
         self.redis_server_version: Optional[Tuple[int, int, int]] = None
@@ -249,7 +248,7 @@ class Queue:
         Returns:
             lock_acquired (bool)
         """
-        lock_acquired = self.connection.set(self.registry_cleaning_key, 1, nx=1, ex=899)
+        lock_acquired = self.connection.set(self.registry_cleaning_key, 1, nx=True, ex=899)
         if not lock_acquired:
             return False
         return lock_acquired
@@ -527,7 +526,7 @@ class Queue:
             func (FunctionReferenceType): The function referce: a callable or the path.
             args (Union[Tuple, List, None], optional): The `*args` to pass to the function. Defaults to None.
             kwargs (Optional[Dict], optional): The `**kwargs` to pass to the function. Defaults to None.
-            timeout (Optional[int], optional): Function timeout. Defaults to None.
+            timeout (Optional[int], optional): Function timeout. Defaults to None, use -1 for infinite timeout.
             result_ttl (Optional[int], optional): Result time to live. Defaults to None.
             ttl (Optional[int], optional): Time to live. Defaults to None.
             failure_ttl (Optional[int], optional): Failure time to live. Defaults to None.
@@ -1300,7 +1299,6 @@ class Queue:
         Returns:
             _type_: _description_
         """
-        connection = connection or resolve_connection()
         if timeout is not None:  # blocking variant
             if timeout == 0:
                 raise ValueError('RQ does not support indefinite timeouts. Please pick a timeout value > 0')
@@ -1345,11 +1343,11 @@ class Queue:
         cls,
         queues: List['Queue'],
         timeout: Optional[int],
-        connection: Optional['Redis'] = None,
-        job_class: Optional['Job'] = None,
+        connection: 'Redis',
+        job_class: Optional[Type['Job']] = None,
         serializer: Any = None,
         death_penalty_class: Optional[Type[BaseDeathPenalty]] = None,
-    ) -> Tuple['Job', 'Queue']:
+    ) -> Optional[Tuple['Job', 'Queue']]:
         """Class method returning the job_class instance at the front of the given
         set of Queues, where the order of the queues is important.
 
@@ -1374,7 +1372,7 @@ class Queue:
         Returns:
             job, queue (Tuple[Job, Queue]): A tuple of Job, Queue
         """
-        job_class: Job = backend_class(cls, 'job_class', override=job_class)
+        job_cls: Type[Job] = backend_class(cls, 'job_class', override=job_class)  # type: ignore
 
         while True:
             queue_keys = [q.key for q in queues]
@@ -1388,12 +1386,12 @@ class Queue:
             queue = cls.from_queue_key(
                 queue_key,
                 connection=connection,
-                job_class=job_class,
+                job_class=job_cls,
                 serializer=serializer,
                 death_penalty_class=death_penalty_class,
             )
             try:
-                job = job_class.fetch(job_id, connection=connection, serializer=serializer)
+                job = job_cls.fetch(job_id, connection=connection, serializer=serializer)
             except NoSuchJobError:
                 # Silently pass on jobs that don't exist (anymore),
                 # and continue in the look

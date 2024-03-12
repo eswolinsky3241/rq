@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from redis import Redis
     from redis.client import Pipeline
 
-from .connections import resolve_connection
+    from rq.executions import Execution
+
 from .defaults import DEFAULT_FAILURE_TTL
 from .exceptions import AbandonedJobError, InvalidJobOperation, NoSuchJobError
 from .job import Job, JobStatus
@@ -45,11 +46,11 @@ class BaseRegistry:
     ):
         if queue:
             self.name = queue.name
-            self.connection = queue.connection or resolve_connection()
+            self.connection = queue.connection
             self.serializer = queue.serializer
         else:
             self.name = name
-            self.connection = connection or resolve_connection()
+            self.connection = connection
             self.serializer = resolve_serializer(serializer)
 
         self.key = self.key_template.format(self.name)
@@ -127,6 +128,18 @@ class BaseRegistry:
                 job_instance = Job.fetch(job_id, connection=connection, serializer=self.serializer)
             job_instance.delete()
         return result
+
+    def remove_executions(self, job: 'Job', pipeline: Optional['Pipeline'] = None):
+        """Removes job executions from registry
+
+        Args:
+            job (Job): The Job to remove from the registry
+            pipeline (Optional[Pipeline], optional): The Redis Pipeline. Defaults to None.
+        """
+        connection = pipeline if pipeline is not None else self.connection
+        execution_ids = [execution.composite_key for execution in job.get_executions()]
+        if execution_ids:
+            return connection.zrem(self.key, *execution_ids)
 
     def get_expired_job_ids(self, timestamp: Optional[float] = None):
         """Returns job ids whose score are less than current timestamp.
@@ -273,6 +286,41 @@ class StartedJobRegistry(BaseRegistry):
                 pipeline.execute()
 
         return job_ids
+
+    def add_execution(self, execution: 'Execution', pipeline: 'Pipeline', ttl=0, xx: bool = False) -> int:
+        """Adds an execution to a registry with expiry time of now + ttl, unless it's -1 which is set to +inf
+
+        Args:
+            execution (Execution): The Execution to add
+            ttl (int, optional): The time to live. Defaults to 0.
+            pipeline (Optional[Pipeline], optional): The Redis Pipeline. Defaults to None.
+            xx (bool, optional): .... Defaults to False.
+
+        Returns:
+            result (int): The ZADD command result
+        """
+        score = ttl if ttl < 0 else current_timestamp() + ttl
+        if score == -1:
+            score = '+inf'
+
+        return pipeline.zadd(self.key, {execution.composite_key: score}, xx=xx)  # type: ignore
+
+    def remove_execution(self, execution: 'Execution', job: 'Job', pipeline: 'Pipeline', delete_job: bool = False):
+        """Removes job from registry and deletes it if `delete_job == True`
+
+        Args:
+            execution (Execution): The Execution to add
+            job (Job): The Job to remove from the registry
+            pipeline (Optional[Pipeline], optional): The Redis Pipeline. Defaults to None.
+            delete_job (bool, optional): If should delete the job.. Defaults to False.
+        """
+        connection = pipeline if pipeline is not None else self.connection
+        result = connection.zrem(self.key, execution.composite_key)
+        # if delete_job:
+        #     job.delete()
+        return result
+
+    # TODO: needs to add a method to cleanup executions
 
 
 class FinishedJobRegistry(BaseRegistry):
@@ -456,16 +504,14 @@ def clean_registries(queue: 'Queue', exception_handlers: list):
     Args:
         queue (Queue): The queue to clean
     """
-    registry = FinishedJobRegistry(
+    FinishedJobRegistry(
         name=queue.name, connection=queue.connection, job_class=queue.job_class, serializer=queue.serializer
-    )
-    registry.cleanup()
-    registry = StartedJobRegistry(
-        name=queue.name, connection=queue.connection, job_class=queue.job_class, serializer=queue.serializer
-    )
-    registry.cleanup(exception_handlers=exception_handlers)
+    ).cleanup()
 
-    registry = FailedJobRegistry(
+    StartedJobRegistry(
         name=queue.name, connection=queue.connection, job_class=queue.job_class, serializer=queue.serializer
-    )
-    registry.cleanup()
+    ).cleanup(exception_handlers=exception_handlers)
+
+    FailedJobRegistry(
+        name=queue.name, connection=queue.connection, job_class=queue.job_class, serializer=queue.serializer
+    ).cleanup()

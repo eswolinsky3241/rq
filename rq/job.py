@@ -18,10 +18,10 @@ if TYPE_CHECKING:
     from redis import Redis
     from redis.client import Pipeline
 
+    from .executions import Execution, ExecutionRegistry
     from .queue import Queue
     from .results import Result
 
-from .connections import resolve_connection
 from .exceptions import DeserializationError, InvalidJobOperation, NoSuchJobError
 from .local import LocalStack
 from .serializers import resolve_serializer
@@ -53,6 +53,13 @@ class JobStatus(str, Enum):
     SCHEDULED = 'scheduled'
     STOPPED = 'stopped'
     CANCELED = 'canceled'
+
+
+def parse_job_id(job_or_execution_id: str) -> str:
+    """Parse a string and returns job ID. This function supports both job ID and execution composite key."""
+    if ':' in job_or_execution_id:
+        return job_or_execution_id.split(':')[0]
+    return job_or_execution_id
 
 
 class Dependency:
@@ -88,7 +95,7 @@ yet been evaluated.
 """
 
 
-def cancel_job(job_id: str, connection: Optional['Redis'] = None, serializer=None, enqueue_dependents: bool = False):
+def cancel_job(job_id: str, connection: 'Redis', serializer=None, enqueue_dependents: bool = False):
     """Cancels the job with the given job ID, preventing execution.
     Use with caution. This will discard any job info (i.e. it can't be requeued later).
 
@@ -174,7 +181,7 @@ class Job:
                 callable.  Defaults to None, meaning no args being passed.
             kwargs (Optional[Dict], optional): A Dictionary of keyword arguments to pass the callable.
                 Defaults to None, meaning no kwargs being passed.
-            connection (Optional[Redis], optional): The Redis connection to use. Defaults to None.
+            connection (Redis): The Redis connection to use. Defaults to None.
                 This will be "resolved" using the `resolve_connection` function when initialzing the Job Class.
             result_ttl (Optional[int], optional): The amount of time in seconds the results should live.
                 Defaults to None.
@@ -562,7 +569,7 @@ class Job:
         self._data = UNEVALUATED
 
     @classmethod
-    def exists(cls, job_id: str, connection: Optional['Redis'] = None) -> bool:
+    def exists(cls, job_id: str, connection: 'Redis') -> bool:
         """Checks whether a Job Hash exists for the given Job ID
 
         Args:
@@ -572,8 +579,6 @@ class Job:
         Returns:
             job_exists (bool): Whether the Job exists
         """
-        if not connection:
-            connection = resolve_connection()
         job_key = cls.key_for(job_id)
         job_exists = connection.exists(job_key)
         return bool(job_exists)
@@ -590,7 +595,8 @@ class Job:
         Returns:
             Job: The Job instance
         """
-        job = cls(id, connection=connection, serializer=serializer)
+        # TODO: this method needs to support fetching jobs based on execution ID
+        job = cls(parse_job_id(id), connection=connection, serializer=serializer)
         job.refresh()
         return job
 
@@ -610,13 +616,14 @@ class Job:
         Returns:
             jobs (list[Job]): A list of Jobs instances.
         """
+        parsed_ids = [parse_job_id(job_id) for job_id in job_ids]
         with connection.pipeline() as pipeline:
-            for job_id in job_ids:
+            for job_id in parsed_ids:
                 pipeline.hgetall(cls.key_for(job_id))
             results = pipeline.execute()
 
         jobs: List[Optional['Job']] = []
-        for i, job_id in enumerate(job_ids):
+        for i, job_id in enumerate(parsed_ids):
             if not results[i]:
                 jobs.append(None)
                 continue
@@ -627,11 +634,12 @@ class Job:
 
         return jobs
 
-    def __init__(self, id: Optional[str] = None, connection: Optional['Redis'] = None, serializer=None):
-        if connection:
-            self.connection = connection
-        else:
-            self.connection = resolve_connection()
+    def __init__(self, id: Optional[str] = None, connection: 'Redis' = None, serializer=None):
+        # Manually check for the presence of the connection argument to preserve
+        # backwards compatibility during the transition to RQ v2.0.0.
+        if not connection:
+            raise TypeError("Job.__init__() missing 1 required argument: 'connection'")
+        self.connection = connection
         self._id = id
         self.created_at = utcnow()
         self._data = UNEVALUATED
@@ -724,7 +732,7 @@ class Job:
         self.last_heartbeat = timestamp
         connection = pipeline if pipeline is not None else self.connection
         connection.hset(self.key, 'last_heartbeat', utcformat(self.last_heartbeat))
-        self.started_job_registry.add(self, ttl, pipeline=pipeline, xx=xx)
+        # self.started_job_registry.add(self, ttl, pipeline=pipeline, xx=xx)
 
     id = property(get_id, set_id)
 
@@ -1091,11 +1099,7 @@ class Job:
         connection = pipeline if pipeline is not None else self.connection
 
         mapping = self.to_dict(include_meta=include_meta, include_result=include_result)
-
-        if self.get_redis_server_version() >= (4, 0, 0):
-            connection.hset(key, mapping=mapping)
-        else:
-            connection.hmset(key, mapping)
+        connection.hset(key, mapping=mapping)
 
     @property
     def supports_redis_streams(self) -> bool:
@@ -1184,6 +1188,15 @@ class Job:
         """
         return self.failed_job_registry.requeue(self, at_front=at_front)
 
+    @property
+    def execution_registry(self) -> 'ExecutionRegistry':
+        from .executions import ExecutionRegistry
+
+        return ExecutionRegistry(self.id, connection=self.connection)
+
+    def get_executions(self) -> List['Execution']:
+        return self.execution_registry.get_executions()
+
     def _remove_from_registries(self, pipeline: Optional['Pipeline'] = None, remove_from_queue: bool = True):
         from .registry import BaseRegistry
 
@@ -1212,9 +1225,12 @@ class Job:
         elif self.is_started:
             from .registry import StartedJobRegistry
 
+            # TODO: need to cleanup job executions too
+
             registry = StartedJobRegistry(
                 self.origin, connection=self.connection, job_class=self.__class__, serializer=self.serializer
             )
+            registry.remove_executions(self, pipeline=pipeline)
             registry.remove(self, pipeline=pipeline)
 
         elif self.is_scheduled:
@@ -1226,6 +1242,7 @@ class Job:
             registry.remove(self, pipeline=pipeline)
 
         elif self.is_failed or self.is_stopped:
+            # TODO: need to cleanup job executions too
             self.failed_job_registry.remove(self, pipeline=pipeline)
 
         elif self.is_canceled:
@@ -1253,12 +1270,7 @@ class Job:
 
         if delete_dependents:
             self.delete_dependents(pipeline=pipeline)
-
-        if self.batch_id:
-            from .batch import Batch
-
-            connection.delete(Batch.get_key(self.batch_id), self.id)  # Delete job from batch
-
+        self.execution_registry.delete(job=self, pipeline=connection)  # type: ignore
         connection.delete(self.key, self.dependents_key, self.dependencies_key)
 
     def delete_dependents(self, pipeline: Optional['Pipeline'] = None):
@@ -1311,10 +1323,7 @@ class Job:
             'started_at': utcformat(self.started_at),  # type: ignore
             'worker_name': worker_name,
         }
-        if self.get_redis_server_version() >= (4, 0, 0):
-            pipeline.hset(self.key, mapping=mapping)
-        else:
-            pipeline.hmset(self.key, mapping=mapping)
+        pipeline.hset(self.key, mapping=mapping)
 
     def _execute(self) -> Any:
         """Actually runs the function with it's *args and **kwargs.
@@ -1441,7 +1450,7 @@ class Job:
             with death_penalty_class(self.failure_callback_timeout, JobTimeoutException, job_id=self.id):
                 self.failure_callback(self, self.connection, *exc_info)
         except Exception:  # noqa
-            logger.exception(f'Job {self.id}: error while executing failure callback')
+            logger.exception('Job %s: error while executing failure callback', self.id)
             raise
 
     def execute_stopped_callback(self, death_penalty_class: Type[BaseDeathPenalty]):
@@ -1451,7 +1460,7 @@ class Job:
             with death_penalty_class(self.stopped_callback_timeout, JobTimeoutException, job_id=self.id):
                 self.stopped_callback(self, self.connection)
         except Exception:  # noqa
-            logger.exception(f'Job {self.id}: error while executing stopped callback')
+            logger.exception('Job %s: error while executing stopped callback', self.id)
             raise
 
     def _handle_success(self, result_ttl: int, pipeline: 'Pipeline'):
@@ -1522,8 +1531,12 @@ class Job:
             scheduled_datetime = datetime.now(timezone.utc) + timedelta(seconds=retry_interval)
             self.set_status(JobStatus.SCHEDULED)
             queue.schedule_job(self, scheduled_datetime, pipeline=pipeline)
+            logger.info(
+                'Job %s: scheduled for retry at %s, %s remaining', self.id, scheduled_datetime, self.retries_left
+            )
         else:
             queue._enqueue_job(self, pipeline=pipeline)
+            logger.info('Job %s: enqueued for retry, %s remaining')
 
     def register_dependency(self, pipeline: Optional['Pipeline'] = None):
         """Jobs may have dependencies. Jobs are enqueued only if the jobs they

@@ -12,7 +12,7 @@ import importlib
 import logging
 import numbers
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -227,7 +227,7 @@ def current_timestamp() -> int:
     return calendar.timegm(datetime.datetime.utcnow().utctimetuple())
 
 
-def backend_class(holder, default_name, override=None):
+def backend_class(holder, default_name, override=None) -> TypeVar('T'):
     """Get a backend class using its default attribute name or an override
 
     Args:
@@ -253,7 +253,7 @@ def str_to_date(date_str: Optional[str]) -> Union[dt.datetime, Any]:
         return utcparse(date_str.decode())
 
 
-def parse_timeout(timeout: Union[int, float, str]) -> int:
+def parse_timeout(timeout: Optional[Union[int, float, str]]) -> Optional[int]:
     """Transfer all kinds of timeout format to an integer representing seconds"""
     if not isinstance(timeout, numbers.Integral) and timeout is not None:
         try:
@@ -290,7 +290,7 @@ def get_version(connection: 'Redis') -> Tuple[int, int, int]:
             setattr(
                 connection,
                 "__rq_redis_server_version",
-                tuple(int(i) for i in connection.info("server")["redis_version"].split('.')[:3]),
+                tuple(int(i) for i in str(connection.info("server")["redis_version"]).split('.')[:3]),
             )
         return getattr(connection, "__rq_redis_server_version")
     except ResponseError:  # fakeredis doesn't implement Redis' INFO command
@@ -379,3 +379,13 @@ def parse_names(queues_or_names: List[Union[str, 'Queue']]) -> List[str]:
         else:
             names.append(str(queue_or_name))
     return names
+
+
+def get_connection_from_queues(queues_or_names: List[Union[str, 'Queue']]) -> Optional['Redis']:
+    """Given a list of strings or queues, returns a connection"""
+    from .queue import Queue
+
+    for queue_or_name in queues_or_names:
+        if isinstance(queue_or_name, Queue):
+            return queue_or_name.connection
+    return None

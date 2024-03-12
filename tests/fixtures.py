@@ -3,20 +3,21 @@ This file contains all jobs that are used in tests.  Each of these test
 fixtures has a slightly different characteristics.
 """
 
-import contextlib
 import os
 import signal
 import subprocess
 import sys
 import time
 from multiprocessing import Process
+from typing import Optional
 
 from redis import Redis
 
-from rq import Connection, Queue, get_current_connection, get_current_job
+from rq import Queue, get_current_job
 from rq.command import send_kill_horse_command, send_shutdown_command
-from rq.decorators import job
+from rq.defaults import DEFAULT_JOB_MONITORING_INTERVAL
 from rq.job import Job
+from rq.suspension import resume
 from rq.worker import HerokuWorker, Worker
 
 
@@ -71,14 +72,14 @@ def some_calculation(x, y, z=1):
     return x * y / z
 
 
-def rpush(key, value, append_worker_name=False, sleep=0):
+def rpush(key, value, connection_kwargs: dict, append_worker_name=False, sleep=0):
     """Push a value into a list in Redis. Useful for detecting the order in
     which jobs were executed."""
     if sleep:
         time.sleep(sleep)
     if append_worker_name:
         value += ':' + get_current_job().worker_name
-    redis = get_current_connection()
+    redis = Redis(**connection_kwargs)
     redis.rpush(key, value)
 
 
@@ -98,8 +99,8 @@ def create_file_after_timeout(path, timeout):
     create_file(path)
 
 
-def create_file_after_timeout_and_setsid(path, timeout):
-    os.setsid()
+def create_file_after_timeout_and_setpgrp(path, timeout):
+    os.setpgrp()
     create_file_after_timeout(path, timeout)
 
 
@@ -111,7 +112,6 @@ def launch_process_within_worker_and_store_pid(path, timeout):
 
 
 def access_self():
-    assert get_current_connection() is not None
     assert get_current_job() is not None
 
 
@@ -160,13 +160,6 @@ class ClassWithAStaticMethod:
         return u"I'm a static method"
 
 
-with Connection():
-
-    @job(queue='default')
-    def decorated_job(x, y):
-        return x + y
-
-
 def black_hole(job, *exc_info):
     # Don't fall through to default behaviour (moving to failed queue)
     return False
@@ -191,7 +184,7 @@ def long_running_job(timeout=10):
     return 'Done sleeping...'
 
 
-def run_dummy_heroku_worker(sandbox, _imminent_shutdown_delay):
+def run_dummy_heroku_worker(sandbox, _imminent_shutdown_delay, connection):
     """
     Run the work horse for a simplified heroku worker where perform_job just
     creates two sentinel files 2 seconds apart.
@@ -211,7 +204,7 @@ def run_dummy_heroku_worker(sandbox, _imminent_shutdown_delay):
                 time.sleep(0.1)
             create_file(os.path.join(sandbox, 'finished'))
 
-    w = TestHerokuWorker(Queue('dummy'))
+    w = TestHerokuWorker(Queue('dummy', connection=connection), connection=connection)
     w.main_work_horse(None, None)
 
 
@@ -229,6 +222,12 @@ def kill_worker(pid: int, double_kill: bool, interval: float = 1.5):
         os.kill(pid, signal.SIGTERM)
 
 
+def resume_worker(connection_kwargs: dict, interval: float = 1):
+    # Wait and resume RQ
+    time.sleep(interval)
+    resume(Redis(**connection_kwargs))
+
+
 class Serializer:
     def loads(self):
         pass
@@ -237,37 +236,44 @@ class Serializer:
         pass
 
 
-def start_worker(queue_name, conn_kwargs, worker_name, burst):
+def start_worker(queue_name, conn_kwargs, worker_name, burst, job_monitoring_interval=None):
     """
     Start a worker. We accept only serializable args, so that this can be
     executed via multiprocessing.
     """
     # Silence stdout (thanks to <https://stackoverflow.com/a/28321717/14153673>)
-    with open(os.devnull, 'w') as devnull:
-        with contextlib.redirect_stdout(devnull):
-            w = Worker([queue_name], name=worker_name, connection=Redis(**conn_kwargs))
-            w.work(burst=burst)
+    # with open(os.devnull, 'w') as devnull:
+    #     with contextlib.redirect_stdout(devnull):
+    w = Worker(
+        [queue_name],
+        name=worker_name,
+        connection=Redis(**conn_kwargs),
+        job_monitoring_interval=job_monitoring_interval or DEFAULT_JOB_MONITORING_INTERVAL,
+    )
+    w.work(burst=burst)
 
 
-def start_worker_process(queue_name, connection=None, worker_name=None, burst=False):
+def start_worker_process(
+    queue_name, connection, worker_name=None, burst=False, job_monitoring_interval: Optional[int] = None
+) -> Process:
     """
     Use multiprocessing to start a new worker in a separate process.
     """
-    connection = connection or get_current_connection()
+    connection = connection
     conn_kwargs = connection.connection_pool.connection_kwargs
-    p = Process(target=start_worker, args=(queue_name, conn_kwargs, worker_name, burst))
+    p = Process(target=start_worker, args=(queue_name, conn_kwargs, worker_name, burst, job_monitoring_interval))
     p.start()
     return p
 
 
-def burst_two_workers(queue, timeout=2, tries=5, pause=0.1):
+def burst_two_workers(queue, connection: Redis, timeout=2, tries=5, pause=0.1):
     """
     Get two workers working simultaneously in burst mode, on a given queue.
     Return after both workers have finished handling jobs, up to a fixed timeout
     on the worker that runs in another process.
     """
-    w1 = start_worker_process(queue.name, worker_name='w1', burst=True)
-    w2 = Worker(queue, name='w2')
+    w1 = start_worker_process(queue.name, worker_name='w1', burst=True, connection=connection)
+    w2 = Worker(queue, name='w2', connection=connection)
     jobs = queue.jobs
     if jobs:
         first_job = jobs[0]
