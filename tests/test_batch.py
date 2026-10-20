@@ -133,6 +133,19 @@ class TestBatch(RQTestCase):
         assert "batch1" in [batch.id for batch in all_batches]
         assert "batch2" in [batch.id for batch in all_batches]
 
+    def test_batch_lock_expires_before_next_maintenance(self):
+        q = Queue(connection=self.testconn)
+        worker = Worker([q], connection=self.testconn, maintenance_interval=30)
+        worker.clean_batch_registries()
+        ttl = self.testconn.ttl(Batch.REDIS_BATCH_CLEANING_KEY)
+        self.assertTrue(0 < ttl < worker.maintenance_interval)
+
+    def test_batch_lock_with_zero_maintenance_interval(self):
+        q = Queue(connection=self.testconn)
+        worker = Worker([q], connection=self.testconn, maintenance_interval=0)
+        worker.clean_batch_registries()
+        self.assertTrue(0 < self.testconn.pttl(Batch.REDIS_BATCH_CLEANING_KEY) <= 1000)
+
     def test_clean_batch_registries_locks_across_workers(self):
         q = Queue(connection=self.testconn)
         worker = Worker([q], connection=self.testconn)
@@ -146,7 +159,6 @@ class TestBatch(RQTestCase):
         first = expired_batch()
         worker.clean_batch_registries()
         self.assertFalse(self.testconn.sismember(Batch.REDIS_BATCH_KEY, first.id))
-        self.assertLessEqual(self.testconn.ttl(Batch.REDIS_BATCH_CLEANING_KEY), worker.maintenance_interval)
         self.assertTrue(self.testconn.exists(Batch.REDIS_BATCH_CLEANING_KEY))
 
         second = expired_batch()
