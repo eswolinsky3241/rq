@@ -1,6 +1,6 @@
 from time import sleep
 
-from rq import Queue, SimpleWorker
+from rq import Queue, SimpleWorker, Worker
 from rq.batch import Batch
 from rq.exceptions import NoSuchBatchError
 from rq.job import Job
@@ -102,6 +102,7 @@ class TestBatch(RQTestCase):
         q.enqueue_many([short_lived_job], batch=batch)
         w.work(burst=True, max_jobs=1)
         sleep(3)
+        self.testconn.delete(Batch.REDIS_BATCH_CLEANING_KEY)
         w.run_maintenance_tasks()
         redis_batches = {as_text(batch) for batch in self.testconn.smembers("rq:batches")}
         assert batch.id not in redis_batches
@@ -131,3 +132,27 @@ class TestBatch(RQTestCase):
         assert len(all_batches) == 2
         assert "batch1" in [batch.id for batch in all_batches]
         assert "batch2" in [batch.id for batch in all_batches]
+
+    def test_clean_batch_registries_locks_across_workers(self):
+        q = Queue(connection=self.testconn)
+        worker = Worker([q], connection=self.testconn)
+
+        def expired_batch():
+            batch = Batch.create(connection=self.testconn)
+            jobs = q.enqueue_many([Queue.prepare_data(say_hello)], batch=batch)
+            self.testconn.delete(jobs[0].key)
+            return batch
+
+        first = expired_batch()
+        worker.clean_batch_registries()
+        self.assertFalse(self.testconn.sismember(Batch.REDIS_BATCH_KEY, first.id))
+        self.assertTrue(self.testconn.exists(Batch.REDIS_BATCH_CLEANING_KEY))
+
+        second = expired_batch()
+        worker.clean_batch_registries()
+        self.assertTrue(self.testconn.sismember(Batch.REDIS_BATCH_KEY, second.id))
+
+        self.testconn.delete(Batch.REDIS_BATCH_CLEANING_KEY)
+        worker.clean_batch_registries()
+        self.assertFalse(self.testconn.sismember(Batch.REDIS_BATCH_KEY, second.id))
+        q.empty()

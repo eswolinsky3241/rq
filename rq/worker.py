@@ -719,7 +719,10 @@ class BaseWorker:
 
     def clean_batch_registries(self):
         """Loop through batches and delete those that have been deleted.
-        If batch still has jobs in its registry, delete those that have expired"""
+        If batch still has jobs in its registry, delete those that have expired.
+        Batches are shared by every queue, so one lock covers all workers."""
+        if not Batch.acquire_maintenance_lock(self.connection):
+            return
         batches = self.connection.smembers(Batch.REDIS_BATCH_KEY)
         for batch in batches:
             try:

@@ -14,6 +14,7 @@ class Batch:
 
     REDIS_BATCH_NAME_PREFIX = 'rq:batch:'
     REDIS_BATCH_KEY = 'rq:batches'
+    REDIS_BATCH_CLEANING_KEY = 'rq:clean_batches'
 
     def __init__(self, connection: Redis, id: str = None):
         self.id = id if id else str(uuid4())
@@ -87,3 +88,13 @@ class Batch:
     def get_key(cls, id: str) -> str:
         """Return the Redis key of the set containing a batch's jobs"""
         return cls.REDIS_BATCH_NAME_PREFIX + id
+
+    @classmethod
+    def acquire_maintenance_lock(cls, connection: Redis) -> bool:
+        """Returns a boolean indicating whether a lock to clean all batches
+        is acquired. A lock expires in 899 seconds (15 minutes - 1 second)
+
+        Returns:
+            lock_acquired (bool)
+        """
+        return bool(connection.set(cls.REDIS_BATCH_CLEANING_KEY, 1, nx=1, ex=899))
