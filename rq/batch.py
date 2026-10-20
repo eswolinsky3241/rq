@@ -90,11 +90,11 @@ class Batch:
         return cls.REDIS_BATCH_NAME_PREFIX + id
 
     @classmethod
-    def acquire_maintenance_lock(cls, connection: Redis) -> bool:
+    def acquire_maintenance_lock(cls, connection: Redis, timeout: int) -> bool:
         """Returns a boolean indicating whether a lock to clean all batches
-        is acquired. A lock expires in 899 seconds (15 minutes - 1 second)
+        is acquired. The lock expires after `timeout` seconds.
 
         Returns:
             lock_acquired (bool)
         """
-        return bool(connection.set(cls.REDIS_BATCH_CLEANING_KEY, 1, nx=1, ex=899))
+        return bool(connection.set(cls.REDIS_BATCH_CLEANING_KEY, 1, nx=1, ex=timeout))

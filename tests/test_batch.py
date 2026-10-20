@@ -146,6 +146,7 @@ class TestBatch(RQTestCase):
         first = expired_batch()
         worker.clean_batch_registries()
         self.assertFalse(self.testconn.sismember(Batch.REDIS_BATCH_KEY, first.id))
+        self.assertLessEqual(self.testconn.ttl(Batch.REDIS_BATCH_CLEANING_KEY), worker.maintenance_interval)
         self.assertTrue(self.testconn.exists(Batch.REDIS_BATCH_CLEANING_KEY))
 
         second = expired_batch()
