@@ -6,7 +6,7 @@ from redis.client import Pipeline
 
 from .exceptions import NoSuchBatchError
 from .job import Job
-from .utils import as_text
+from .utils import as_text, missing_keys
 
 
 class Batch:
@@ -14,6 +14,7 @@ class Batch:
 
     REDIS_BATCH_NAME_PREFIX = 'rq:batch:'
     REDIS_BATCH_KEY = 'rq:batches'
+    REDIS_BATCH_CLEANING_KEY = 'rq:clean_batches'
 
     def __init__(self, connection: Redis, id: str = None):
         self.id = id if id else str(uuid4())
@@ -36,20 +37,11 @@ class Batch:
         We assume while running this that alive jobs have all been fetched from Redis in fetch_jobs method"""
 
         pipe = pipeline if pipeline else self.connection.pipeline()
-        job_ids = [as_text(job) for job in list(self.connection.smembers(self.key))]
-        expired_jobs = []
-        with self.connection.pipeline() as p:
-            for job in job_ids:
-                p.exists(Job.key_for(job))
-            results = p.execute()
-
-        for i, key_exists in enumerate(results):
-            if not key_exists:
-                expired_jobs.append(job_ids[i])
-
-        for job in expired_jobs:
-            job_ids.remove(job)
-            pipe.srem(self.key, job)
+        job_ids_by_key = {Job.key_for(as_text(job)): as_text(job) for job in self.connection.smembers(self.key)}
+        job_ids = list(job_ids_by_key.values())
+        for key in missing_keys(self.connection, list(job_ids_by_key)):
+            job_ids.remove(job_ids_by_key[key])
+            pipe.srem(self.key, job_ids_by_key[key])
 
         if not job_ids:
             self.delete()
@@ -87,3 +79,13 @@ class Batch:
     def get_key(cls, id: str) -> str:
         """Return the Redis key of the set containing a batch's jobs"""
         return cls.REDIS_BATCH_NAME_PREFIX + id
+
+    @classmethod
+    def acquire_maintenance_lock(cls, connection: Redis, timeout: int) -> bool:
+        """Returns a boolean indicating whether a lock to clean all batches
+        is acquired. The lock expires after `timeout` seconds.
+
+        Returns:
+            lock_acquired (bool)
+        """
+        return bool(connection.set(cls.REDIS_BATCH_CLEANING_KEY, 1, nx=1, ex=timeout))

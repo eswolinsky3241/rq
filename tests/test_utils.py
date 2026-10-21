@@ -1,6 +1,6 @@
 import datetime
 import re
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from redis import Redis
 
@@ -14,6 +14,7 @@ from rq.utils import (
     get_version,
     import_attribute,
     is_nonstring_iterable,
+    missing_keys,
     parse_timeout,
     split_list,
     truncate_long_string,
@@ -24,6 +25,14 @@ from tests import RQTestCase, fixtures
 
 
 class TestUtils(RQTestCase):
+    def test_missing_keys(self):
+        self.testconn.set('rq:tmp:alive', 1)
+        with patch.object(self.testconn, 'exists', wraps=self.testconn.exists) as exists:
+            self.assertEqual(missing_keys(self.testconn, ['rq:tmp:alive']), [])
+        exists.assert_called_once()
+        self.assertEqual(missing_keys(self.testconn, ['rq:tmp:alive', 'rq:tmp:gone']), ['rq:tmp:gone'])
+        self.assertEqual(missing_keys(self.testconn, []), [])
+
     def test_parse_timeout(self):
         """Ensure function parse_timeout works correctly"""
         self.assertEqual(12, parse_timeout(12))
