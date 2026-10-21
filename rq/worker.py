@@ -722,7 +722,7 @@ class BaseWorker:
         If batch still has jobs in its registry, delete those that have expired.
         Batches are shared by every queue, so one lock covers all workers.
         The lock expires just before the next maintenance tick so that tick can take it."""
-        lock_timeout = max(self.maintenance_interval - 1, 1)
+        lock_timeout = max(int(self.maintenance_interval) - 1, 1)
         if not Batch.acquire_maintenance_lock(self.connection, lock_timeout):
             return
         batches = self.connection.smembers(Batch.REDIS_BATCH_KEY)
