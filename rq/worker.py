@@ -267,7 +267,7 @@ class BaseWorker:
         """
         return len(worker_registration.get_keys(queue=queue, connection=connection))
 
-    def _set_ip_address(self, connection: 'Redis'):
+    def _set_ip_address(self, connection: 'Redis') -> None:
         try:
             connection.client_setname(self.name)
         except redis.exceptions.ResponseError:
@@ -276,13 +276,20 @@ class BaseWorker:
             return
 
         try:
-            self.ip_address = connection.client_info()['addr']
+            self.ip_address = str(connection.client_info()['addr'])
         except redis.exceptions.ResponseError:
             # CLIENT INFO needs Redis 6.2. CLIENT LIST works on older servers but returns every connection.
             self.ip_address = self._ip_address_from_client_list(connection)
 
     def _ip_address_from_client_list(self, connection: 'Redis') -> str:
-        client_addresses = [client['addr'] for client in connection.client_list() if client['name'] == self.name]
+        try:
+            client_addresses = [
+                client['addr'] for client in connection.client_list() if client.get('name') == self.name
+            ]
+        except redis.exceptions.ResponseError:
+            warnings.warn('CLIENT LIST command not supported, setting ip_address to unknown', Warning)
+            return 'unknown'
+
         if not client_addresses:
             warnings.warn('CLIENT LIST command not supported, setting ip_address to unknown', Warning)
             return 'unknown'
