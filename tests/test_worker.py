@@ -97,6 +97,72 @@ class TestWorker(RQTestCase):
         w = Worker(Queue('foo'), serializer=json)
         self.assertEqual(w.queues[0].name, 'foo')
 
+    def test_create_worker_with_unsupported_client_list(self):
+        """Worker creation falls back to unknown IP when CLIENT LIST is unsupported."""
+        q = Queue('foo', connection=self.testconn)
+
+        unsupported = redis.exceptions.ResponseError('unknown command')
+        with mock.patch.object(self.testconn, 'client_setname') as mock_client_setname:
+            with mock.patch.object(self.testconn, 'client_info', side_effect=unsupported):
+                with mock.patch.object(self.testconn, 'client_list', side_effect=unsupported):
+                    with pytest.warns(Warning, match='CLIENT LIST command not supported'):
+                        w = Worker([q], connection=self.testconn)
+
+        mock_client_setname.assert_called_once_with(w.name)
+        self.assertEqual(w.ip_address, 'unknown')
+
+    def test_create_worker_reads_own_address_with_client_info(self):
+        """Worker creation asks for its own connection instead of listing every client."""
+        if get_version(self.testconn) < (6, 2, 0):
+            self.skipTest('CLIENT INFO needs Redis 6.2')
+        q = Queue('foo', connection=self.testconn)
+
+        with mock.patch.object(self.testconn, 'client_list') as mock_client_list:
+            w = Worker([q], connection=self.testconn)
+
+        mock_client_list.assert_not_called()
+        self.assertNotEqual(w.ip_address, 'unknown')
+
+    def test_create_worker_falls_back_to_client_list(self):
+        """Worker creation lists clients when the server predates CLIENT INFO."""
+        q = Queue('foo', connection=self.testconn)
+
+        with mock.patch.object(
+            self.testconn, 'client_info', side_effect=redis.exceptions.ResponseError('unknown subcommand')
+        ):
+            with mock.patch.object(self.testconn, 'client_list', wraps=self.testconn.client_list) as mock_client_list:
+                w = Worker([q], connection=self.testconn)
+
+        mock_client_list.assert_called_once()
+        self.assertNotEqual(w.ip_address, 'unknown')
+
+    def test_create_worker_with_client_list_missing_own_connection(self):
+        """Worker creation falls back to unknown IP when CLIENT LIST does not include its own name."""
+        q = Queue('foo', connection=self.testconn)
+
+        with mock.patch.object(
+            self.testconn, 'client_info', side_effect=redis.exceptions.ResponseError('unknown subcommand')
+        ):
+            with mock.patch.object(self.testconn, 'client_list', return_value=[]):
+                with pytest.warns(Warning, match='CLIENT LIST command not supported'):
+                    w = Worker([q], connection=self.testconn)
+
+        self.assertEqual(w.ip_address, 'unknown')
+
+    def test_create_worker_with_unsupported_client_setname(self):
+        """Worker creation falls back to unknown IP when CLIENT SETNAME is unsupported."""
+        q = Queue('foo', connection=self.testconn)
+
+        with mock.patch.object(
+            self.testconn, 'client_setname', side_effect=redis.exceptions.ResponseError('unknown command')
+        ):
+            with mock.patch.object(self.testconn, 'client_info') as mock_client_info:
+                with pytest.warns(Warning, match='CLIENT SETNAME command not supported'):
+                    w = Worker([q], connection=self.testconn)
+
+        mock_client_info.assert_not_called()
+        self.assertEqual(w.ip_address, 'unknown')
+
     def test_work_and_quit(self):
         """Worker processes work, then quits."""
         fooq, barq = Queue('foo'), Queue('bar')

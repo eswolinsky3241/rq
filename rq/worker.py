@@ -201,18 +201,7 @@ class BaseWorker:
         if prepare_for_work:
             self.hostname: Optional[str] = socket.gethostname()
             self.pid: Optional[int] = os.getpid()
-            try:
-                connection.client_setname(self.name)
-            except redis.exceptions.ResponseError:
-                warnings.warn('CLIENT SETNAME command not supported, setting ip_address to unknown', Warning)
-                self.ip_address = 'unknown'
-            else:
-                client_adresses = [client['addr'] for client in connection.client_list() if client['name'] == self.name]
-                if len(client_adresses) > 0:
-                    self.ip_address = client_adresses[0]
-                else:
-                    warnings.warn('CLIENT LIST command not supported, setting ip_address to unknown', Warning)
-                    self.ip_address = 'unknown'
+            self._set_ip_address(connection)
         else:
             self.hostname = None
             self.pid = None
@@ -277,6 +266,34 @@ class BaseWorker:
             length (int): The queue length.
         """
         return len(worker_registration.get_keys(queue=queue, connection=connection))
+
+    def _set_ip_address(self, connection: 'Redis') -> None:
+        try:
+            connection.client_setname(self.name)
+        except redis.exceptions.ResponseError:
+            warnings.warn('CLIENT SETNAME command not supported, setting ip_address to unknown', Warning)
+            self.ip_address = 'unknown'
+            return
+
+        try:
+            self.ip_address = str(connection.client_info()['addr'])
+        except redis.exceptions.ResponseError:
+            # CLIENT INFO needs Redis 6.2. CLIENT LIST works on older servers but returns every connection.
+            self.ip_address = self._ip_address_from_client_list(connection)
+
+    def _ip_address_from_client_list(self, connection: 'Redis') -> str:
+        try:
+            client_addresses = [
+                client['addr'] for client in connection.client_list() if client.get('name') == self.name
+            ]
+        except redis.exceptions.ResponseError:
+            warnings.warn('CLIENT LIST command not supported, setting ip_address to unknown', Warning)
+            return 'unknown'
+
+        if not client_addresses:
+            warnings.warn('CLIENT LIST command not supported, setting ip_address to unknown', Warning)
+            return 'unknown'
+        return client_addresses[0]
 
     @property
     def should_run_maintenance_tasks(self):
