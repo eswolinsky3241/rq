@@ -113,6 +113,8 @@ class TestWorker(RQTestCase):
 
     def test_create_worker_reads_own_address_with_client_info(self):
         """Worker creation asks for its own connection instead of listing every client."""
+        if get_version(self.testconn) < (6, 2, 0):
+            self.skipTest('CLIENT INFO needs Redis 6.2')
         q = Queue('foo', connection=self.testconn)
 
         with mock.patch.object(self.testconn, 'client_list') as mock_client_list:
